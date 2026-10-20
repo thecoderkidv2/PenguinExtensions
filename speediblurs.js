@@ -1,5 +1,5 @@
 /*
-   Speedi Blurs v4
+   Speedi Blurs v1.2
    Created for PenguinMod
    Credits: @scaliefanatic47
 
@@ -7,7 +7,7 @@
    Marius Bjørge "Bandwidth Efficient Rendering" (SIGGRAPH 2015),
    Jorge Jimenez "Next Generation Post Processing in CoD:AW" (SIGGRAPH 2014).
 
-   Requires unsandboxed execution and a Scratch-compatible renderer.
+   v1.2 untested, some things may not work
 */
 (async function (Scratch) {
     'use strict';
@@ -47,9 +47,22 @@
     const asString = (v) => v === null || v === undefined ? '' : String(v);
     const asBool = (v) => v === true || v === 1 || v === '1' || v === 'true';
 
-    // Stage reference size (Scratch/PenguinMod default)
-    const STAGE_W = 480;
-    const STAGE_H = 360;
+    // ------------------------------------------------------------------
+    // Live stage measurement
+    // ------------------------------------------------------------------
+    function getStageSize() {
+        try {
+            const runtime = Scratch.vm && Scratch.vm.runtime;
+            if (runtime) {
+                const w = Number(runtime.stageWidth);
+                const h = Number(runtime.stageHeight);
+                if (Number.isFinite(w) && w > 0 && Number.isFinite(h) && h > 0) {
+                    return { width: w, height: h };
+                }
+            }
+        } catch (e) { /* fall through */ }
+        return { width: 480, height: 360 };
+    }
 
     // ------------------------------------------------------------------
     // Canvas helpers
@@ -84,26 +97,24 @@
         return c;
     }
 
-    // Returns fit dims if image exceeds stage bounds, else null.
+    // Returns fit dims based on live stage size, or null if not needed.
     function computeFit(sourceCanvas) {
-        if (sourceCanvas.width <= STAGE_W && sourceCanvas.height <= STAGE_H) return null;
-        const r = Math.min(STAGE_W / sourceCanvas.width, STAGE_H / sourceCanvas.height);
+        const stage = getStageSize();
+        if (sourceCanvas.width <= stage.width && sourceCanvas.height <= stage.height) return null;
+        const r = Math.min(stage.width / sourceCanvas.width, stage.height / sourceCanvas.height);
         return {
             width: Math.max(1, Math.round(sourceCanvas.width * r)),
             height: Math.max(1, Math.round(sourceCanvas.height * r))
         };
     }
 
-    // Downscale → run → upscale back to native size, if fit is requested.
     function withFit(sourceCanvas, fitDims, fn) {
         if (!fitDims) return fn(sourceCanvas);
 
         const nativeW = sourceCanvas.width;
         const nativeH = sourceCanvas.height;
         const work = drawScaled(sourceCanvas, fitDims.width, fitDims.height);
-
         const result = fn(work);
-
         return drawScaled(result, nativeW, nativeH);
     }
 
