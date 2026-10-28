@@ -1,430 +1,728 @@
 /*
-   Canvas Distortion for PenguinMod  v1
-   made by scaliefanatic47 for the retro remix competition!
+   Canvas Effects v2
+   PenguinMod, live SVG-filter post-processing on the stage canvas.
+   @scaliefanatic47 on PenguinMod
 */
-(async function(Scratch) {
-    const variables = {};
+(async function (Scratch) {
+    'use strict';
 
     if (!Scratch.extensions.unsandboxed) {
-        alert("This extension needs to be unsandboxed to run!");
+        alert('Canvas Effects v2 needs to be unsandboxed!');
         return;
     }
 
-    const ExtForge = {
-        Broadcasts: new function() {
-            this.raw_ = {};
-            this.register = (name, blocks) => { this.raw_[name] = blocks; };
-            this.execute  = async (name) => { if (this.raw_[name]) await this.raw_[name](); };
-        },
-        Variables: new function() {
-            this.raw_ = {};
-            this.set = (name, value) => { this.raw_[name] = value; };
-            this.get = (name) => this.raw_[name] ?? null;
-        },
-        Vector: class {
-            constructor(x, y) { this.x = x; this.y = y; }
-            static from(v) {
-                if (v instanceof ExtForge.Vector) return v;
-                if (v instanceof Array) return new ExtForge.Vector(Number(v[0]), Number(v[1]));
-                if (v instanceof Object) return new ExtForge.Vector(Number(v.x), Number(v.y));
-                return new ExtForge.Vector();
-            }
-            add(v) { return new Vector(this.x + v.x, this.y + v.y); }
-            set(x, y) { return new Vector(x ?? this.x, y ?? this.y); }
-        },
-        Utils: {
-            setList: (list, index, value) => { [...list][index] = value; return list; },
-            lists_foreach: { index: [0], value: [null], depth: 0 },
-            countString: (x, y) => y.length == 0 ? 0 : x.split(y).length - 1
-        }
-    };
+    const BT = Scratch.BlockType || {};
+    const AT = Scratch.ArgumentType || {};
+    const REPORTER = BT.REPORTER || 'reporter';
+    const COMMAND = BT.COMMAND || 'command';
+    const LABEL = BT.LABEL || 'label';
+    const STRING = AT.STRING || 'string';
+    const NUMBER = AT.NUMBER || 'number';
+    const COLOR = AT.COLOR || 'color';
 
+    const SVG_NS = 'http://www.w3.org/2000/svg';
+    const XLINK_NS = 'http://www.w3.org/1999/xlink';
+
+    const finite = (v, fb, min, max) => {
+        let n = Number(v);
+        if (!Number.isFinite(n)) n = fb;
+        if (min !== undefined) n = Math.max(min, n);
+        if (max !== undefined) n = Math.min(max, n);
+        return n;
+    };
+    const str = (v) => (v === null || v === undefined ? '' : String(v));
+
+    // ================================================================
+    // SVG helpers
+    // ================================================================
+    function svg(tag, attrs, children) {
+        const el = document.createElementNS(SVG_NS, tag);
+        if (attrs) for (const k in attrs) el.setAttribute(k, attrs[k]);
+        if (children) for (const c of children) el.appendChild(c);
+        return el;
+    }
+    function feImageWithHref(attrs, dataUri) {
+        const el = svg('feImage', attrs);
+        el.setAttribute('href', dataUri);
+        try { el.setAttributeNS(XLINK_NS, 'xlink:href', dataUri); } catch (_) {}
+        return el;
+    }
+
+    // ================================================================
+    // Mask generators
+    // ================================================================
+    function makeRadialDisplacementMap(mode, strength, size) {
+        size = size || 256;
+        const c = document.createElement('canvas');
+        c.width = c.height = size;
+        const ctx = c.getContext('2d');
+        const img = ctx.createImageData(size, size);
+        const d = img.data;
+        const cx = size / 2, cy = size / 2;
+        const maxR = Math.sqrt(cx * cx + cy * cy);
+        const s = Math.min(1, Math.max(0, strength));
+        for (let y = 0; y < size; y++) {
+            for (let x = 0; x < size; x++) {
+                const i = (y * size + x) * 4;
+                const dx = x - cx, dy = y - cy;
+                const dist = Math.sqrt(dx * dx + dy * dy) || 0.0001;
+                const norm = dist / maxR;
+                let mag = 0;
+                if (mode === 'bulge') mag = Math.cos(norm * Math.PI / 2) * s;
+                else if (mode === 'shrink') mag = -Math.cos(norm * Math.PI / 2) * s;
+                else if (mode === 'fisheye') mag = Math.pow(norm, 2) * s;
+                const rx = (dx / dist) * mag;
+                const ry = (dy / dist) * mag;
+                d[i] = Math.max(0, Math.min(255, Math.round(128 + rx * 127)));
+                d[i + 1] = Math.max(0, Math.min(255, Math.round(128 + ry * 127)));
+                d[i + 2] = 0;
+                d[i + 3] = 255;
+            }
+        }
+        ctx.putImageData(img, 0, 0);
+        return c;
+    }
+
+    function makeVignetteMask(strength, softness, size) {
+        size = size || 256;
+        const c = document.createElement('canvas');
+        c.width = c.height = size;
+        const ctx = c.getContext('2d');
+        const cx = size / 2, cy = size / 2;
+        const maxR = Math.sqrt(cx * cx + cy * cy);
+        const s = Math.min(1, Math.max(0, strength));
+        const soft = Math.max(0.01, Math.min(1, softness));
+        const start = Math.max(0, 1 - soft);
+        const edgeVal = Math.round(255 * (1 - s));
+        const g = ctx.createRadialGradient(cx, cy, 0, cx, cy, maxR);
+        g.addColorStop(0, 'rgb(255,255,255)');
+        g.addColorStop(start * 0.7, 'rgb(255,255,255)');
+        g.addColorStop(1, `rgb(${edgeVal},${edgeVal},${edgeVal})`);
+        ctx.fillStyle = g;
+        ctx.fillRect(0, 0, size, size);
+        return c;
+    }
+
+    function makeRadialGlowMask(lx, ly, falloff, size) {
+        size = size || 256;
+        const c = document.createElement('canvas');
+        c.width = c.height = size;
+        const ctx = c.getContext('2d');
+        const cx = Math.max(0, Math.min(1, lx)) * size;
+        const cy = Math.max(0, Math.min(1, ly)) * size;
+        let maxD = 0;
+        for (const [px, py] of [[0, 0], [size, 0], [0, size], [size, size]]) {
+            maxD = Math.max(maxD, Math.hypot(px - cx, py - cy));
+        }
+        const soft = Math.max(0.01, Math.min(1, falloff));
+        const g = ctx.createRadialGradient(cx, cy, 0, cx, cy, maxD);
+        g.addColorStop(0, 'rgb(255,255,255)');
+        g.addColorStop(soft * 0.5, 'rgb(200,200,200)');
+        g.addColorStop(1, 'rgb(0,0,0)');
+        ctx.fillStyle = g;
+        ctx.fillRect(0, 0, size, size);
+        return c;
+    }
+
+    // ================================================================
+    // Filter builder
+    // ================================================================
+    function buildFilter(filterEl, cw, ch, effects) {
+        let prev = 'SourceGraphic';
+        let idx = 0;
+        const R = (tag, attrs, children) => {
+            const el = svg(tag, Object.assign({ in: prev }, attrs), children);
+            filterEl.appendChild(el);
+            return el;
+        };
+        const nameFor = (suffix) => `fx${idx}_${suffix}`;
+
+        for (const name in effects) {
+            const p = effects[name];
+            const curIdx = idx++;
+            const n = (s) => `fx${curIdx}_${s}`;
+
+            switch (name) {
+                case 'blur': {
+                    const sd = Math.max(0.1, finite(p.strength, 10) / 5);
+                    R('feGaussianBlur', { stdDeviation: sd, result: n('out') });
+                    prev = n('out');
+                    break;
+                }
+
+                case 'bloom': {
+                    const th = Math.min(0.99, Math.max(0, finite(p.threshold, 0.6)));
+                    const slope = 1 / Math.max(0.01, 1 - th);
+                    const inter = -th * slope;
+                    R('feColorMatrix', {
+                        type: 'matrix',
+                        values: '0.2126 0.7152 0.0722 0 0  0.2126 0.7152 0.0722 0 0  0.2126 0.7152 0.0722 0 0  0 0 0 1 0',
+                        result: n('lum'),
+                    });
+                    const ct = svg('feComponentTransfer', { in: n('lum'), result: n('bright') });
+                    for (const ch of ['R', 'G', 'B']) ct.appendChild(svg(`feFunc${ch}`, { type: 'linear', slope, intercept: inter }));
+                    filterEl.appendChild(ct);
+                    R('feGaussianBlur', { in: n('bright'), stdDeviation: Math.max(0.1, finite(p.radius, 6)), result: n('blur') });
+                    const boost = svg('feComponentTransfer', { in: n('blur'), result: n('boost') });
+                    for (const ch of ['R', 'G', 'B']) boost.appendChild(svg(`feFunc${ch}`, { type: 'linear', slope: finite(p.intensity, 0.8), intercept: 0 }));
+                    filterEl.appendChild(boost);
+                    R('feComposite', { in: prev, in2: n('boost'), operator: 'arithmetic', k1: 0, k2: 1, k3: 1, k4: 0, result: n('out') });
+                    prev = n('out');
+                    break;
+                }
+
+                case 'sepia': {
+                    const a = Math.min(1, Math.max(0, finite(p.amount, 1)));
+                    const idn = [1, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 1, 0];
+                    const sep = [0.393, 0.769, 0.189, 0, 0, 0.349, 0.686, 0.168, 0, 0, 0.272, 0.534, 0.131, 0, 0, 0, 0, 0, 1, 0];
+                    const m = idn.map((v, i) => (v * (1 - a) + sep[i] * a).toFixed(4));
+                    R('feColorMatrix', { type: 'matrix', values: m.join(' '), result: n('out') });
+                    prev = n('out');
+                    break;
+                }
+
+                case 'grayscale': {
+                    const a = Math.min(1, Math.max(0, finite(p.amount, 1)));
+                    R('feColorMatrix', { type: 'saturate', values: 1 - a, result: n('out') });
+                    prev = n('out');
+                    break;
+                }
+
+                case 'anaglyph': {
+                    const sep = finite(p.separation, 4, -50, 50);
+                    const ang = finite(p.angle, 0) * Math.PI / 180;
+                    const dx = Math.cos(ang) * sep;
+                    const dy = Math.sin(ang) * sep;
+                    R('feColorMatrix', {
+                        type: 'matrix',
+                        values: '1 0 0 0 0  0 0 0 0 0  0 0 0 0 0  0 0 0 1 0',
+                        result: n('r'),
+                    });
+                    R('feOffset', { in: n('r'), dx: -dx, dy: -dy, result: n('rO') });
+                    R('feColorMatrix', {
+                        type: 'matrix',
+                        values: '0 0 0 0 0  0 1 0 0 0  0 0 1 0 0  0 0 0 1 0',
+                        result: n('gb'),
+                    });
+                    R('feOffset', { in: n('gb'), dx, dy, result: n('gbO') });
+                    R('feComposite', { in: n('rO'), in2: n('gbO'), operator: 'arithmetic', k1: 0, k2: 1, k3: 1, k4: 0, result: n('out') });
+                    prev = n('out');
+                    break;
+                }
+
+                case 'chromatic': {
+                    const amt = Math.min(100, Math.max(0, finite(p.amount, 20)));
+                    const strength = amt / 100;
+                    const mapOut = makeRadialDisplacementMap('bulge', strength);
+                    const mapIn = makeRadialDisplacementMap('shrink', strength);
+                    const scale = Math.min(cw, ch) * strength * 0.6;
+                    const uriOut = mapOut.toDataURL('image/png');
+                    const uriIn = mapIn.toDataURL('image/png');
+                    R('feColorMatrix', {
+                        type: 'matrix',
+                        values: '1 0 0 0 0  0 0 0 0 0  0 0 0 0 0  0 0 0 1 0',
+                        result: n('r'),
+                    });
+                    filterEl.appendChild(feImageWithHref({
+                        x: 0, y: 0, width: cw, height: ch, preserveAspectRatio: 'none', result: n('mOut'),
+                    }, uriOut));
+                    R('feDisplacementMap', { in: n('r'), in2: n('mOut'), scale, xChannelSelector: 'R', yChannelSelector: 'G', result: n('rD') });
+                    R('feColorMatrix', {
+                        type: 'matrix',
+                        values: '0 0 0 0 0  0 1 0 0 0  0 0 0 0 0  0 0 0 1 0',
+                        result: n('g'),
+                    });
+                    R('feColorMatrix', {
+                        type: 'matrix',
+                        values: '0 0 0 0 0  0 0 0 0 0  0 0 1 0 0  0 0 0 1 0',
+                        result: n('b'),
+                    });
+                    filterEl.appendChild(feImageWithHref({
+                        x: 0, y: 0, width: cw, height: ch, preserveAspectRatio: 'none', result: n('mIn'),
+                    }, uriIn));
+                    R('feDisplacementMap', { in: n('b'), in2: n('mIn'), scale, xChannelSelector: 'R', yChannelSelector: 'G', result: n('bD') });
+                    R('feComposite', { in: n('rD'), in2: n('g'), operator: 'arithmetic', k2: 1, k3: 1, k4: 0, result: n('rg') });
+                    R('feComposite', { in: n('rg'), in2: n('bD'), operator: 'arithmetic', k2: 1, k3: 1, k4: 0, result: n('out') });
+                    prev = n('out');
+                    break;
+                }
+
+                case 'grade': {
+                    const br = finite(p.brightness, 0, -1, 1);
+                    const ct = finite(p.contrast, 1, 0, 3);
+                    const sat = finite(p.saturation, 1, 0, 3);
+                    const slope = ct;
+                    const inter = br + (1 - ct) * 0.5;
+                    const ctEl = svg('feComponentTransfer', { in: prev, result: n('graded') });
+                    for (const ch of ['R', 'G', 'B']) ctEl.appendChild(svg(`feFunc${ch}`, { type: 'linear', slope, intercept: inter }));
+                    filterEl.appendChild(ctEl);
+                    R('feColorMatrix', { in: n('graded'), type: 'saturate', values: sat, result: n('out') });
+                    prev = n('out');
+                    break;
+                }
+
+                case 'vignette': {
+                    const mask = makeVignetteMask(finite(p.strength, 0.5), finite(p.softness, 0.5));
+                    const uri = mask.toDataURL('image/png');
+                    filterEl.appendChild(feImageWithHref({
+                        x: 0, y: 0, width: cw, height: ch, preserveAspectRatio: 'none', result: n('mask'),
+                    }, uri));
+                    R('feBlend', { in: prev, in2: n('mask'), mode: 'multiply', result: n('out') });
+                    prev = n('out');
+                    break;
+                }
+
+                case 'fisheye':
+                case 'bulge':
+                case 'shrink': {
+                    const st = Math.min(100, Math.max(0, finite(p.strength, 30)));
+                    const map = makeRadialDisplacementMap(name, st / 100);
+                    const uri = map.toDataURL('image/png');
+                    const scale = Math.min(cw, ch) * (st / 100) * 2;
+                    filterEl.appendChild(feImageWithHref({
+                        x: 0, y: 0, width: cw, height: ch, preserveAspectRatio: 'none', result: n('map'),
+                    }, uri));
+                    R('feDisplacementMap', { in: prev, in2: n('map'), scale, xChannelSelector: 'R', yChannelSelector: 'G', result: n('out') });
+                    prev = n('out');
+                    break;
+                }
+
+                case 'sharpen': {
+                    const a = Math.max(0, finite(p.amount, 1));
+                    R('feConvolveMatrix', {
+                        order: '3 3',
+                        kernelMatrix: `0 ${-a} 0  ${-a} ${1 + 4 * a} ${-a}  0 ${-a} 0`,
+                        divisor: 1, preserveAlpha: 'true', result: n('out'),
+                    });
+                    prev = n('out');
+                    break;
+                }
+
+                case 'edge': {
+                    R('feConvolveMatrix', {
+                        order: '3 3', kernelMatrix: '0 -1 0  -1 4 -1  0 -1 0',
+                        divisor: 1, preserveAlpha: 'true', result: n('edges'),
+                    });
+                    const gain = 1 / Math.max(0.02, finite(p.threshold, 0.2));
+                    R('feColorMatrix', {
+                        in: n('edges'), type: 'matrix',
+                        values: `${gain} 0 0 0 0  0 ${gain} 0 0 0  0 0 ${gain} 0 0  0 0 0 1 0`,
+                        result: n('out'),
+                    });
+                    prev = n('out');
+                    break;
+                }
+
+                case 'streaks': {
+                    const th = Math.min(0.99, Math.max(0, finite(p.threshold, 0.7)));
+                    const slope = 1 / Math.max(0.01, 1 - th);
+                    const inter = -th * slope;
+                    R('feColorMatrix', {
+                        type: 'matrix',
+                        values: '0.2126 0.7152 0.0722 0 0  0.2126 0.7152 0.0722 0 0  0.2126 0.7152 0.0722 0 0  0 0 0 1 0',
+                        result: n('lum'),
+                    });
+                    const ct = svg('feComponentTransfer', { in: n('lum'), result: n('bright') });
+                    for (const ch of ['R', 'G', 'B']) ct.appendChild(svg(`feFunc${ch}`, { type: 'linear', slope, intercept: inter }));
+                    filterEl.appendChild(ct);
+                    const vertical = p.mode === 'vertical';
+                    const sd = Math.max(0.1, finite(p.length, 30) / 2);
+                    R('feGaussianBlur', { in: n('bright'), stdDeviation: vertical ? `0 ${sd}` : `${sd} 0`, result: n('blur') });
+                    const boost = svg('feComponentTransfer', { in: n('blur'), result: n('boost') });
+                    for (const ch of ['R', 'G', 'B']) boost.appendChild(svg(`feFunc${ch}`, { type: 'linear', slope: finite(p.intensity, 0.6), intercept: 0 }));
+                    filterEl.appendChild(boost);
+                    R('feComposite', { in: prev, in2: n('boost'), operator: 'arithmetic', k2: 1, k3: 1, k4: 0, result: n('out') });
+                    prev = n('out');
+                    break;
+                }
+
+                case 'godrays': {
+                    const th = Math.min(0.99, Math.max(0, finite(p.threshold, 0.4)));
+                    const slope = 1 / Math.max(0.01, 1 - th);
+                    const inter = -th * slope;
+                    R('feColorMatrix', {
+                        type: 'matrix',
+                        values: '0.2126 0.7152 0.0722 0 0  0.2126 0.7152 0.0722 0 0  0.2126 0.7152 0.0722 0 0  0 0 0 1 0',
+                        result: n('lum'),
+                    });
+                    const ct = svg('feComponentTransfer', { in: n('lum'), result: n('bright') });
+                    for (const ch of ['R', 'G', 'B']) ct.appendChild(svg(`feFunc${ch}`, { type: 'linear', slope, intercept: inter }));
+                    filterEl.appendChild(ct);
+                    R('feGaussianBlur', {
+                        in: n('bright'),
+                        stdDeviation: Math.max(0.5, finite(p.radius, 20)),
+                        result: n('blur'),
+                    });
+                    const mask = makeRadialGlowMask(finite(p.lx, 0.5), finite(p.ly, 0.3), finite(p.falloff, 0.7));
+                    const uri = mask.toDataURL('image/png');
+                    filterEl.appendChild(feImageWithHref({
+                        x: 0, y: 0, width: cw, height: ch, preserveAspectRatio: 'none', result: n('mask'),
+                    }, uri));
+                    R('feBlend', { in: n('blur'), in2: n('mask'), mode: 'multiply', result: n('weighted') });
+                    const boost = svg('feComponentTransfer', { in: n('weighted'), result: n('boost') });
+                    for (const ch of ['R', 'G', 'B']) boost.appendChild(svg(`feFunc${ch}`, { type: 'linear', slope: finite(p.intensity, 0.8), intercept: 0 }));
+                    filterEl.appendChild(boost);
+                    R('feComposite', { in: prev, in2: n('boost'), operator: 'arithmetic', k2: 1, k3: 1, k4: 0, result: n('out') });
+                    prev = n('out');
+                    break;
+                }
+            }
+        }
+        return prev;
+    }
+
+    // ================================================================
+    // Extension
+    // ================================================================
     class Extension {
         constructor(runtime) {
             this.runtime = runtime;
-            this.effects = { stage: {}, pen: {} };
-            this.lastLayer = 'stage';
+            this.effects = {};
             this.svgRoot = null;
             this.filterElement = null;
-            this.displacementMaps = {};
-            this.stageCanvas = null;
-            this.filterId = 'pm-canvas-distortion-filter';
-            this.debug = true;
-
+            this.filterId = null;
+            this.filterDirty = false;
+            this.canvas = null;
+            this.lastCW = 0;
+            this.lastCH = 0;
             this.bgColor = null;
-            this.bgParent = null;
-            this.originalParentBg = null;
-            this.preserveBackground = false;
+            this._origParentBg = null;
+            this._bgParent = null;
 
-            console.log('[Distortion] Extension constructed');
-            this.ensureSvg();
-            this.findCanvas();
+            this._ensureSvg();
+            this._startWatcher();
         }
 
-        log(...a)   { if (this.debug) console.log('[Distortion]', ...a); }
-        warn(...a)  { console.warn('[Distortion]', ...a); }
-        error(...a) { console.error('[Distortion]', ...a); }
-
-        ensureSvg() {
-            if (this.svgRoot && this.svgRoot.parentNode) return this.svgRoot;
-            try {
-                const svg = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
-                svg.setAttribute('width', '0');
-                svg.setAttribute('height', '0');
-                svg.setAttribute('aria-hidden', 'true');
-                Object.assign(svg.style, {
-                    position: 'fixed', left: '-99999px', top: '-99999px',
-                    width: '0', height: '0', overflow: 'hidden', pointerEvents: 'none'
-                });
-                document.body.appendChild(svg);
-                this.svgRoot = svg;
-                this.log('SVG root created');
-            } catch (e) { this.error('Failed to create SVG root:', e); }
-            return this.svgRoot;
+        // ---------- SVG container ----------
+        _ensureSvg() {
+            if (this.svgRoot && this.svgRoot.parentNode) return;
+            const s = svg('svg', {
+                width: '0', height: '0', 'aria-hidden': 'true',
+                style: 'position:fixed;left:-99999px;top:-99999px;width:0;height:0;overflow:hidden;pointer-events:none;',
+            });
+            document.body.appendChild(s);
+            this.svgRoot = s;
         }
 
-        findCanvas() {
-            if (this.stageCanvas && this.stageCanvas.isConnected) return this.stageCanvas;
-            this.stageCanvas = null;
+        // ---------- Canvas discovery ----------
+        _findCanvas() {
             const vm = (typeof Scratch !== 'undefined' && Scratch.vm) || window.vm;
-            const runtime = this.runtime || vm?.runtime;
-            const renderer = runtime?.renderer;
-            const tryCanvas = (name, c) => {
-                if (c && c.tagName === 'CANVAS') {
-                    this.log(`Found canvas via ${name}: ${c.width}x${c.height}`);
-                    this.stageCanvas = c;
-                    return true;
-                }
-                return false;
-            };
+            const runtime = this.runtime || (vm && vm.runtime);
+            const renderer = runtime && runtime.renderer;
             if (renderer) {
-                if (tryCanvas('renderer.canvas', renderer.canvas)) return this.stageCanvas;
-                if (tryCanvas('renderer.gl.canvas', renderer.gl && renderer.gl.canvas)) return this.stageCanvas;
-                if (tryCanvas('renderer._canvas', renderer._canvas)) return this.stageCanvas;
+                if (renderer.canvas && renderer.canvas.tagName === 'CANVAS') return renderer.canvas;
+                if (renderer.gl && renderer.gl.canvas && renderer.gl.canvas.tagName === 'CANVAS') return renderer.gl.canvas;
+                if (renderer._canvas && renderer._canvas.tagName === 'CANVAS') return renderer._canvas;
             }
             const all = document.querySelectorAll('canvas');
+            let best = null, bestArea = 0;
             for (const c of all) {
-                if (c.width === 480 && c.height === 360) { this.stageCanvas = c; return c; }
-            }
-            let largest = null, largestArea = 0;
-            for (const c of all) {
+                if (c.width === 480 && c.height === 360) return c;
                 const area = c.width * c.height;
-                if (area > largestArea && c.width >= 100 && c.height >= 100) { largest = c; largestArea = area; }
+                if (area > bestArea && c.width >= 100 && c.height >= 100) { best = c; bestArea = area; }
             }
-            if (largest) { this.stageCanvas = largest; return largest; }
-            this.warn('Could not find any stage canvas!');
-            return null;
-        }
-        generateMap(effectName, strength, size = 256) {
-            const canvas = document.createElement('canvas');
-            canvas.width = canvas.height = size;
-            const ctx = canvas.getContext('2d');
-            const imageData = ctx.createImageData(size, size);
-            const data = imageData.data;
-            const cx = size / 2, cy = size / 2;
-            const maxR = Math.sqrt(cx * cx + cy * cy);
-            const s = Math.min(Math.max(Number(strength) || 0, 0), 100) / 100;
-            for (let y = 0; y < size; y++) {
-                for (let x = 0; x < size; x++) {
-                    const i = (y * size + x) * 4;
-                    const dx = x - cx, dy = y - cy;
-                    const dist = Math.sqrt(dx * dx + dy * dy) || 0.0001;
-                    const norm = dist / maxR;
-                    let mag = 0;
-                    if (effectName === 'bulge')          mag =  Math.cos(norm * Math.PI / 2) * s;
-                    else if (effectName === 'shrink')    mag = -Math.cos(norm * Math.PI / 2) * s;
-                    else if (effectName === 'fisheye')   mag =  Math.pow(norm, 2) * s;
-                    data[i]     = Math.max(0, Math.min(255, Math.round(128 + (dx / dist) * mag * 127)));
-                    data[i + 1] = Math.max(0, Math.min(255, Math.round(128 + (dy / dist) * mag * 127)));
-                    data[i + 2] = 0;
-                    data[i + 3] = 255;
-                }
-            }
-            ctx.putImageData(imageData, 0, 0);
-            return canvas;
+            return best;
         }
 
-        rebuildFilter() {
-            if (!this.ensureSvg()) { this.error('No SVG root'); return; }
+        // ---------- Watcher: re-apply filter when canvas swaps / resizes / style is stripped ----------
+        _startWatcher() {
+            const loop = () => {
+                try { this._ensureApplied(); } catch (e) { /* silent */ }
+                requestAnimationFrame(loop);
+            };
+            requestAnimationFrame(loop);
+        }
+
+        _ensureApplied() {
+            const canvas = this._findCanvas();
+            if (!canvas) return;
+
+            if (canvas !== this.canvas) {
+                this.canvas = canvas;
+                this.filterDirty = true;
+                this.lastCW = 0;
+                this.lastCH = 0;
+            }
+            if (canvas.width !== this.lastCW || canvas.height !== this.lastCH) {
+                this.lastCW = canvas.width;
+                this.lastCH = canvas.height;
+                this.filterDirty = true;
+            }
+            if (this.filterId && (!this.filterElement || !this.filterElement.parentNode)) {
+                this.filterDirty = true;
+            }
+
+            if (this.filterDirty) this._rebuildFilter();
+
+            const hasFx = Object.keys(this.effects).length > 0;
+            const want = hasFx && this.filterId ? `url(#${this.filterId})` : '';
+            if ((canvas.style.filter || '') !== want) {
+                canvas.style.filter = '';
+                void canvas.offsetWidth;
+                canvas.style.filter = want;
+                canvas.style.webkitFilter = want;
+            }
+
+            this._applyBgColor(canvas);
+        }
+
+        // ---------- Rebuild the SVG filter ----------
+        _rebuildFilter() {
+            if (!this._ensureSvgSafe()) return;
 
             if (this.filterElement && this.filterElement.parentNode) {
                 this.filterElement.parentNode.removeChild(this.filterElement);
             }
             this.filterElement = null;
+            this.filterId = null;
 
-            const allEffects = { ...this.effects.stage, ...this.effects.pen };
-            const active = Object.entries(allEffects).filter(([_, s]) => Number(s) > 0);
-            this.log('Active effects:', active);
-
-            if (active.length === 0) { this.applyFilter(); return; }
-
-            const filter = document.createElementNS('http://www.w3.org/2000/svg', 'filter');
-            filter.setAttribute('id', this.filterId);
-            filter.setAttribute('x', '-50%');
-            filter.setAttribute('y', '-50%');
-            filter.setAttribute('width', '200%');
-            filter.setAttribute('height', '200%');
-            filter.setAttribute('filterUnits', 'objectBoundingBox');
-            filter.setAttribute('primitiveUnits', 'userSpaceOnUse');
-            filter.setAttribute('color-interpolation-filters', 'sRGB');
-
-            let prevResult = 'SourceGraphic';
-
-            active.forEach(([name, strength], idx) => {
-                const key = `${name}_${strength}`;
-                let mapCanvas = this.displacementMaps[key];
-                if (!mapCanvas) {
-                    mapCanvas = this.generateMap(name, strength);
-                    this.displacementMaps[key] = mapCanvas;
-                }
-                let url;
-                try { url = mapCanvas.toDataURL('image/png'); }
-                catch (e) { this.error('toDataURL failed:', e); return; }
-
-                const feImage = document.createElementNS('http://www.w3.org/2000/svg', 'feImage');
-                feImage.setAttribute('x', '0');
-                feImage.setAttribute('y', '0');
-                feImage.setAttribute('width', '100%');
-                feImage.setAttribute('height', '100%');
-                feImage.setAttribute('preserveAspectRatio', 'none');
-                feImage.setAttribute('result', `map${idx}`);
-                feImage.setAttribute('href', url);
-                try { feImage.setAttributeNS('http://www.w3.org/1999/xlink', 'xlink:href', url); } catch (_) {}
-                filter.appendChild(feImage);
-
-                const disp = document.createElementNS('http://www.w3.org/2000/svg', 'feDisplacementMap');
-                disp.setAttribute('in', prevResult);
-                disp.setAttribute('in2', `map${idx}`);
-                disp.setAttribute('scale', '100');
-                disp.setAttribute('xChannelSelector', 'R');
-                disp.setAttribute('yChannelSelector', 'G');
-                disp.setAttribute('result', `disp${idx}`);
-                filter.appendChild(disp);
-                prevResult = `disp${idx}`;
-            });
-
-            if (this.preserveBackground) {
-                const fill = document.createElementNS('http://www.w3.org/2000/svg', 'feComposite');
-                fill.setAttribute('in', 'SourceGraphic');
-                fill.setAttribute('in2', prevResult);
-                fill.setAttribute('operator', 'out');
-                fill.setAttribute('result', 'bgFill');
-                filter.appendChild(fill);
-
-                const merge = document.createElementNS('http://www.w3.org/2000/svg', 'feComposite');
-                merge.setAttribute('in', 'bgFill');
-                merge.setAttribute('in2', prevResult);
-                merge.setAttribute('operator', 'over');
-                filter.appendChild(merge);
+            const keys = Object.keys(this.effects);
+            if (keys.length === 0) {
+                this.filterDirty = false;
+                return;
             }
+            const canvas = this.canvas || this._findCanvas();
+            if (!canvas) { this.filterDirty = false; return; }
+            const cw = canvas.width || 480;
+            const ch = canvas.height || 360;
 
+            const fid = 'canvas-fx-' + Math.random().toString(36).slice(2, 10);
+            const filter = svg('filter', {
+                id: fid,
+                x: '-25%', y: '-25%', width: '150%', height: '150%',
+                filterUnits: 'objectBoundingBox',
+                primitiveUnits: 'userSpaceOnUse',
+                'color-interpolation-filters': 'sRGB',
+            });
+            buildFilter(filter, cw, ch, this.effects);
             this.svgRoot.appendChild(filter);
             this.filterElement = filter;
-            this.log('Filter rebuilt (preserve=' + this.preserveBackground + ')');
-            this.applyFilter();
+            this.filterId = fid;
+            this.filterDirty = false;
         }
 
-        applyFilter() {
-            const canvas = this.findCanvas();
-            if (!canvas) { this.warn('No canvas to filter'); return; }
-
-            const layer = this.lastLayer || 'stage';
-            const layerEffects = this.effects[layer] || {};
-            const hasActive = Object.values(layerEffects).some(s => Number(s) > 0);
-
-            let cssFilter = (hasActive && this.filterElement) ? `url(#${this.filterId})` : '';
-            canvas.style.filter = cssFilter;
-            canvas.style.webkitFilter = cssFilter;
-            this.log(`CSS filter on canvas: "${cssFilter}" (layer=${layer})`);
-
-            this.applyBackgroundColor();
+        _ensureSvgSafe() {
+            this._ensureSvg();
+            return !!this.svgRoot;
         }
 
-        applyBackgroundColor() {
-            const canvas = this.findCanvas();
-            if (!canvas) return;
+        // ---------- Background colour for distortion gaps ----------
+        _applyBgColor(canvas) {
             const parent = canvas.parentElement;
             if (!parent) return;
-
             if (this.bgColor) {
-                if (this.bgParent !== parent) {
-                    if (!this.bgParent) {
-                        this.originalParentBg = parent.style.backgroundColor || '';
-                    }
-                    this.bgParent = parent;
+                if (this._bgParent !== parent) {
+                    if (!this._bgParent) this._origParentBg = parent.style.backgroundColor || '';
+                    this._bgParent = parent;
                 }
                 parent.style.backgroundColor = this.bgColor;
-                this.log(`Parent background set to ${this.bgColor}`);
-            } else if (this.bgParent) {
-                this.bgParent.style.backgroundColor = this.originalParentBg || '';
-                this.log('Parent background restored');
-                this.bgParent = null;
-                this.originalParentBg = null;
+            } else if (this._bgParent === parent) {
+                parent.style.backgroundColor = this._origParentBg || '';
+                this._bgParent = null;
+                this._origParentBg = null;
             }
         }
 
-        setBgColor(color) {
-            this.bgColor = color;
-            this.applyBackgroundColor();
+        // ---------- Effect state ----------
+        _setEffect(name, params) {
+            this.effects[name] = params;
+            this.filterDirty = true;
+        }
+        _clearEffect(name) {
+            if (name in this.effects) {
+                delete this.effects[name];
+                this.filterDirty = true;
+            }
+        }
+        _clearAll() {
+            this.effects = {};
+            this.filterDirty = true;
         }
 
-        clearBgColor() {
-            this.bgColor = null;
-            this.applyBackgroundColor();
+        // ---------- Capture ----------
+        _capture(withEffects) {
+            const canvas = this._findCanvas();
+            if (!canvas) return '';
+            if (withEffects && this.filterId && Object.keys(this.effects).length > 0) {
+                try {
+                    const off = document.createElement('canvas');
+                    off.width = canvas.width;
+                    off.height = canvas.height;
+                    const ctx = off.getContext('2d');
+                    ctx.filter = `url(#${this.filterId})`;
+                    ctx.drawImage(canvas, 0, 0);
+                    const uri = off.toDataURL('image/png');
+                    if (uri && uri.length > 200) return uri;
+                } catch (e) {
+                    console.warn('[CanvasEffects] Filter bake failed, falling back to unfiltered:', e);
+                }
+            }
+            try { return canvas.toDataURL('image/png'); } catch (e) {
+                console.error('[CanvasEffects] Capture failed:', e);
+                return '';
+            }
         }
 
-        setPreserveBackground(state) {
-            this.preserveBackground = (state === 'on');
-            this.rebuildFilter();
-        }
-
-        // --------------------------------------------------------------
-        // Effect state
-        // --------------------------------------------------------------
-        setEffect(layer, effectName, strength) {
-            if (!this.effects[layer]) this.effects[layer] = {};
-            this.effects[layer][effectName] = Math.max(0, Number(strength) || 0);
-            this.lastLayer = layer;
-            this.rebuildFilter();
-        }
-
-        clearEffect(layer, effectName) {
-            if (!this.effects[layer]) return;
-            if (effectName) delete this.effects[layer][effectName];
-            else this.effects[layer] = {};
-            this.lastLayer = layer;
-            this.rebuildFilter();
-        }
-
-        clearAll() {
-            this.effects = { stage: {}, pen: {} };
-            this.lastLayer = 'stage';
-            this.rebuildFilter();
-        }
-
-        testFilter() {
-            const c = this.findCanvas();
-            if (!c) { this.error('No canvas for test'); return; }
-            c.style.filter = 'blur(20px)';
-            setTimeout(() => { c.style.filter = ''; }, 2000);
-        }
-
-        // --------------------------------------------------------------
+        // ============================================================
         // Block definitions
-        // --------------------------------------------------------------
+        // ============================================================
         getInfo() {
+            const argNum = (d) => ({ type: NUMBER, defaultValue: d });
+            const argStr = (d, m) => ({ type: STRING, defaultValue: d, menu: m });
+            const cmd = (opcode, text, args) => ({ opcode, blockType: COMMAND, text, arguments: args || {} });
+
             return {
-                id: 'penguinmodCanvasDistortion',
-                name: 'Canvas Distortion',
+                id: 'canvasEffectsV2',
+                name: 'Canvas Effects v2',
                 color1: '#0fbd8c',
                 blocks: [
+                    { blockType: LABEL, text: 'Light & Color' },
+                    cmd('applyBlur', 'apply blur strength [STRENGTH]', { STRENGTH: argNum(10) }),
+                    cmd('applyBloom', 'apply bloom threshold [THRESHOLD] intensity [INTENSITY] radius [RADIUS]', {
+                        THRESHOLD: argNum(0.6), INTENSITY: argNum(0.8), RADIUS: argNum(6),
+                    }),
+                    cmd('applyStreaks', 'apply streaks [MODE] intensity [INTENSITY] length [LENGTH] threshold [THRESHOLD]', {
+                        MODE: argStr('horizontal', 'streakModeMenu'), INTENSITY: argNum(0.6), LENGTH: argNum(30), THRESHOLD: argNum(0.7),
+                    }),
+                    cmd('applyGodRays', 'apply god rays light x [LX] y [LY] intensity [INTENSITY] radius [RADIUS] falloff [FALLOFF] threshold [THRESHOLD]', {
+                        LX: argNum(0.5), LY: argNum(0.3), INTENSITY: argNum(0.8), RADIUS: argNum(20), FALLOFF: argNum(0.7), THRESHOLD: argNum(0.4),
+                    }),
+                    cmd('applySepia', 'apply sepia amount [AMOUNT]', { AMOUNT: argNum(1) }),
+                    cmd('applyGrayscale', 'apply grayscale amount [AMOUNT]', { AMOUNT: argNum(1) }),
+                    cmd('applyAnaglyph', 'apply anaglyph 3D separation [SEPARATION] angle [ANGLE]', {
+                        SEPARATION: argNum(4), ANGLE: argNum(0),
+                    }),
+                    cmd('applyChromatic', 'apply chromatic aberration amount [AMOUNT]', { AMOUNT: argNum(20) }),
+                    cmd('applyGrade', 'apply color grade brightness [BRIGHTNESS] contrast [CONTRAST] saturation [SATURATION]', {
+                        BRIGHTNESS: argNum(0), CONTRAST: argNum(1), SATURATION: argNum(1),
+                    }),
+                    cmd('applyVignette', 'apply vignette strength [STRENGTH] softness [SOFTNESS]', {
+                        STRENGTH: argNum(0.5), SOFTNESS: argNum(0.5),
+                    }),
+
+                    { blockType: LABEL, text: 'Distortion' },
+                    cmd('applyFisheye', 'apply fisheye strength [STRENGTH]', { STRENGTH: argNum(30) }),
+                    cmd('applyBulge', 'apply bulge strength [STRENGTH]', { STRENGTH: argNum(30) }),
+                    cmd('applyShrink', 'apply shrink strength [STRENGTH]', { STRENGTH: argNum(30) }),
+
+                    { blockType: LABEL, text: 'Detail' },
+                    cmd('applySharpen', 'apply sharpen amount [AMOUNT]', { AMOUNT: argNum(1) }),
+                    cmd('applyEdge', 'apply edge detect threshold [THRESHOLD]', { THRESHOLD: argNum(0.2) }),
+
+                    { blockType: LABEL, text: 'Control' },
+                    cmd('clearEffect', 'clear [EFFECT] effect', {
+                        EFFECT: argStr('blur', 'effectNameMenu'),
+                    }),
+                    cmd('clearAll', 'clear all effects'),
+                    cmd('setBgFill', 'set canvas background fill [COLOR]', {
+                        COLOR: { type: COLOR, defaultValue: '#000000' },
+                    }),
+                    cmd('clearBgFill', 'clear canvas background fill'),
+
+                    { blockType: LABEL, text: 'Output' },
                     {
-                        opcode: 'applyEffect',
-                        blockType: Scratch.BlockType.COMMAND,
-                        text: 'apply [EFFECT] effect with strength [STRENGTH] to [LAYER]',
+                        opcode: 'stageAsPNG',
+                        blockType: REPORTER,
+                        text: 'stage as PNG [WITHFX]',
                         arguments: {
-                            EFFECT:   { type: Scratch.ArgumentType.STRING, menu: 'effectMenu',  defaultValue: 'bulge' },
-                            STRENGTH: { type: Scratch.ArgumentType.NUMBER, defaultValue: 60 },
-                            LAYER:    { type: Scratch.ArgumentType.STRING, menu: 'layerMenu',   defaultValue: 'stage' }
-                        }
+                            WITHFX: argStr('with effects', 'captureMenu'),
+                        },
                     },
-                    {
-                        opcode: 'setEffectBlock',
-                        blockType: Scratch.BlockType.COMMAND,
-                        text: 'set [EFFECT] effect strength to [STRENGTH] on [LAYER]',
-                        arguments: {
-                            EFFECT:   { type: Scratch.ArgumentType.STRING, menu: 'effectMenu',  defaultValue: 'fisheye' },
-                            STRENGTH: { type: Scratch.ArgumentType.NUMBER, defaultValue: 30 },
-                            LAYER:    { type: Scratch.ArgumentType.STRING, menu: 'layerMenu',   defaultValue: 'stage' }
-                        }
-                    },
-                    {
-                        opcode: 'clearEffectBlock',
-                        blockType: Scratch.BlockType.COMMAND,
-                        text: 'clear [EFFECT] effect on [LAYER]',
-                        arguments: {
-                            EFFECT: { type: Scratch.ArgumentType.STRING, menu: 'effectMenu', defaultValue: 'bulge' },
-                            LAYER:  { type: Scratch.ArgumentType.STRING, menu: 'layerMenu',  defaultValue: 'stage' }
-                        }
-                    },
-                    {
-                        opcode: 'clearAllBlock',
-                        blockType: Scratch.BlockType.COMMAND,
-                        text: 'clear all distortion effects'
-                    },
-                    '---',
-                    {
-                        opcode: 'setBgColorBlock',
-                        blockType: Scratch.BlockType.COMMAND,
-                        text: 'set canvas background fill to [COLOR]',
-                        arguments: {
-                            COLOR: { type: Scratch.ArgumentType.COLOR, defaultValue: '#0a0a0a' }
-                        }
-                    },
-                    {
-                        opcode: 'clearBgColorBlock',
-                        blockType: Scratch.BlockType.COMMAND,
-                        text: 'clear canvas background fill'
-                    },
-                    {
-                        opcode: 'setPreserveBackgroundBlock',
-                        blockType: Scratch.BlockType.COMMAND,
-                        text: 'preserve background (fill distortion gaps with original): [STATE]',
-                        arguments: {
-                            STATE: {
-                                type: Scratch.ArgumentType.STRING,
-                                menu: 'onOffMenu',
-                                defaultValue: 'on'
-                            }
-                        }
-                    },
-                    '---',
-                    {
-                        opcode: 'testFilterBlock',
-                        blockType: Scratch.BlockType.COMMAND,
-                        text: 'TEST: flash 20px blur on canvas (debug)'
-                    }
                 ],
                 menus: {
-                    effectMenu: {
+                    streakModeMenu: {
                         acceptReporters: false,
                         items: [
-                            { text: 'bulge',   value: 'bulge'   },
-                            { text: 'shrink',  value: 'shrink'  },
-                            { text: 'fisheye', value: 'fisheye' }
-                        ]
+                            { text: 'horizontal', value: 'horizontal' },
+                            { text: 'vertical', value: 'vertical' },
+                        ],
                     },
-                    layerMenu: {
+                    captureMenu: {
                         acceptReporters: false,
                         items: [
-                            { text: 'entire stage', value: 'stage' },
-                            { text: 'pen layer',    value: 'pen'   }
-                        ]
+                            { text: 'with effects', value: 'with effects' },
+                            { text: 'without effects', value: 'without effects' },
+                        ],
                     },
-                    onOffMenu: {
+                    effectNameMenu: {
                         acceptReporters: false,
                         items: [
-                            { text: 'on',  value: 'on'  },
-                            { text: 'off', value: 'off' }
-                        ]
-                    }
-                }
+                            'blur', 'bloom', 'streaks', 'godrays', 'sepia', 'grayscale',
+                            'anaglyph', 'chromatic', 'grade', 'vignette',
+                            'fisheye', 'bulge', 'shrink', 'sharpen', 'edge',
+                        ],
+                    },
+                },
             };
         }
 
-        // --------------------------------------------------------------
+        // ============================================================
         // Block implementations
-        // --------------------------------------------------------------
-        applyEffect(args)                { this.setEffect(args.LAYER, args.EFFECT, args.STRENGTH); }
-        setEffectBlock(args)             { this.setEffect(args.LAYER, args.EFFECT, args.STRENGTH); }
-        clearEffectBlock(args)           { this.clearEffect(args.LAYER, args.EFFECT); }
-        clearAllBlock()                  { this.clearAll(); }
-        setBgColorBlock(args)            { this.setBgColor(args.COLOR); }
-        clearBgColorBlock()              { this.clearBgColor(); }
-        setPreserveBackgroundBlock(args) { this.setPreserveBackground(args.STATE); }
-        testFilterBlock()                { this.testFilter(); }
+        // ============================================================
+        applyBlur(a) { this._setEffect('blur', { strength: finite(a.STRENGTH, 10, 0, 500) }); }
+        applyBloom(a) {
+            this._setEffect('bloom', {
+                threshold: finite(a.THRESHOLD, 0.6, 0, 1),
+                intensity: finite(a.INTENSITY, 0.8, 0, 3),
+                radius: finite(a.RADIUS, 6, 0.1, 200),
+            });
+        }
+        applyStreaks(a) {
+            this._setEffect('streaks', {
+                mode: str(a.MODE) === 'vertical' ? 'vertical' : 'horizontal',
+                intensity: finite(a.INTENSITY, 0.6, 0, 3),
+                length: finite(a.LENGTH, 30, 0, 500),
+                threshold: finite(a.THRESHOLD, 0.7, 0, 1),
+            });
+        }
+        applyGodRays(a) {
+            this._setEffect('godrays', {
+                lx: finite(a.LX, 0.5, 0, 1),
+                ly: finite(a.LY, 0.3, 0, 1),
+                intensity: finite(a.INTENSITY, 0.8, 0, 3),
+                radius: finite(a.RADIUS, 20, 0.1, 400),
+                falloff: finite(a.FALLOFF, 0.7, 0.01, 1),
+                threshold: finite(a.THRESHOLD, 0.4, 0, 1),
+            });
+        }
+        applySepia(a) { this._setEffect('sepia', { amount: finite(a.AMOUNT, 1, 0, 1) }); }
+        applyGrayscale(a) { this._setEffect('grayscale', { amount: finite(a.AMOUNT, 1, 0, 1) }); }
+        applyAnaglyph(a) {
+            this._setEffect('anaglyph', {
+                separation: finite(a.SEPARATION, 4, -100, 100),
+                angle: finite(a.ANGLE, 0, -180, 180),
+            });
+        }
+        applyChromatic(a) { this._setEffect('chromatic', { amount: finite(a.AMOUNT, 20, 0, 100) }); }
+        applyGrade(a) {
+            this._setEffect('grade', {
+                brightness: finite(a.BRIGHTNESS, 0, -1, 1),
+                contrast: finite(a.CONTRAST, 1, 0, 3),
+                saturation: finite(a.SATURATION, 1, 0, 3),
+            });
+        }
+        applyVignette(a) {
+            this._setEffect('vignette', {
+                strength: finite(a.STRENGTH, 0.5, 0, 1),
+                softness: finite(a.SOFTNESS, 0.5, 0.01, 1),
+            });
+        }
+        applyFisheye(a) { this._setEffect('fisheye', { strength: finite(a.STRENGTH, 30, 0, 100) }); }
+        applyBulge(a) { this._setEffect('bulge', { strength: finite(a.STRENGTH, 30, 0, 100) }); }
+        applyShrink(a) { this._setEffect('shrink', { strength: finite(a.STRENGTH, 30, 0, 100) }); }
+        applySharpen(a) { this._setEffect('sharpen', { amount: finite(a.AMOUNT, 1, 0, 10) }); }
+        applyEdge(a) { this._setEffect('edge', { threshold: finite(a.THRESHOLD, 0.2, 0.01, 1) }); }
+
+        clearEffect(a) { this._clearEffect(str(a.EFFECT)); }
+        clearAll() { this._clearAll(); }
+
+        setBgFill(a) { this.bgColor = str(a.COLOR) || '#000000'; this.filterDirty = false; }
+        clearBgFill() { this.bgColor = null; }
+
+        stageAsPNG(a) {
+            return this._capture(str(a.WITHFX) !== 'without effects');
+        }
     }
 
-    let extension = new Extension(Scratch.vm?.runtime);
-    Scratch.extensions.register(extension);
+    Scratch.extensions.register(new Extension(Scratch.vm && Scratch.vm.runtime));
 })(Scratch);
