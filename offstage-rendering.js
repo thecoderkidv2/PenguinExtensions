@@ -10,7 +10,7 @@ class OffstageRendering {
 
   getInfo() {
     return {
-      id: 'offstageOverlay',
+      id: 'offstageRendering',
       name: 'Offstage Rendering',
       color1: '#0FBD8C',
       color2: '#0DA57A',
